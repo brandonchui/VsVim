@@ -70,9 +70,14 @@ namespace Vim.UI.Wpf.Implementation.BlockCaret
         private Dictionary<int, CaretData> _caretDataMap = new Dictionary<int, CaretData>();
         private CaretDisplay _caretDisplay;
         private FormattedText _formattedText;
+        private FormattedText _cachedFormattedText;
+        private Typeface _cachedTypeface;
+        private double _cachedFontSize;
         private bool _isDestroyed;
         private bool _isUpdating;
         private double _caretOpacity = 1.0;
+        private DispatcherTimer _updateCaretTimer;
+        private bool _updateCaretPending;
 
         public ITextView TextView
         {
@@ -87,7 +92,7 @@ namespace Vim.UI.Wpf.Implementation.BlockCaret
                 if (_caretDisplay != value)
                 {
                     _caretDisplay = value;
-                    UpdateCaret();
+                    UpdateCaret(throttle: false);
                 }
             }
         }
@@ -100,7 +105,7 @@ namespace Vim.UI.Wpf.Implementation.BlockCaret
                 if (_caretOpacity != value)
                 {
                     _caretOpacity = value;
-                    UpdateCaret();
+                    UpdateCaret(throttle: false);
                 }
             }
         }
@@ -177,6 +182,14 @@ namespace Vim.UI.Wpf.Implementation.BlockCaret
             _textView.Closed += OnTextViewClosed;
 
             _blinkTimer = CreateBlinkTimer(protectedOperations, OnCaretBlinkTimer);
+            _updateCaretTimer = new DispatcherTimer(
+                TimeSpan.FromMilliseconds(16),
+                DispatcherPriority.Render,
+                protectedOperations.GetProtectedEventHandler(OnUpdateCaretTimerTick),
+                Dispatcher.CurrentDispatcher)
+            {
+                IsEnabled = false
+            };
         }
 
         internal BlockCaret(
@@ -271,13 +284,12 @@ namespace Vim.UI.Wpf.Implementation.BlockCaret
                     protectedOperations.GetProtectedEventHandler(onCaretBlinkTimer),
                     Dispatcher.CurrentDispatcher)
                 {
-                    IsEnabled = caretBlinkTime != null
+                    IsEnabled = false
                 };
                 return blinkTimer;
             }
             catch (ArgumentOutOfRangeException)
             {
-                // Hit the bug ... just create a simple timer with a default interval.
                 VimTrace.TraceError("Error creating BlockCaret DispatcherTimer");
                 var blinkTimer = new DispatcherTimer(
                     TimeSpan.FromSeconds(2),
@@ -285,7 +297,7 @@ namespace Vim.UI.Wpf.Implementation.BlockCaret
                     protectedOperations.GetProtectedEventHandler(onCaretBlinkTimer),
                     Dispatcher.CurrentDispatcher)
                 {
-                    IsEnabled = true
+                    IsEnabled = false
                 };
                 return blinkTimer;
             }
@@ -293,6 +305,16 @@ namespace Vim.UI.Wpf.Implementation.BlockCaret
 
         private void OnCaretEvent(object sender, EventArgs e)
         {
+            if (e is TextViewLayoutChangedEventArgs layoutArgs)
+            {
+                if (!layoutArgs.VerticalTranslation &&
+                    layoutArgs.NewOrReformattedLines.Count == 0 &&
+                    layoutArgs.TranslatedLines.Count == 0)
+                {
+                    return;
+                }
+            }
+
             UpdateCaret();
         }
 
@@ -321,7 +343,7 @@ namespace Vim.UI.Wpf.Implementation.BlockCaret
         {
             RestartBlinkCycle();
 
-            UpdateCaret();
+            UpdateCaret(throttle: false);
         }
 
         private void RestartBlinkCycle()
@@ -458,6 +480,31 @@ namespace Vim.UI.Wpf.Implementation.BlockCaret
                 pixelsPerDip: 1);
         }
 
+        private FormattedText GetOrCreateFormattedText()
+        {
+            var textRunProperties = _classificationFormatMap.DefaultTextProperties;
+            var currentTypeface = textRunProperties.Typeface;
+            var currentFontSize = textRunProperties.FontRenderingEmSize;
+
+            if (_cachedFormattedText == null ||
+                !_cachedTypeface.Equals(currentTypeface) ||
+                Math.Abs(_cachedFontSize - currentFontSize) > 0.01)
+            {
+                _cachedTypeface = currentTypeface;
+                _cachedFontSize = currentFontSize;
+                _cachedFormattedText = new FormattedText(
+                    "A",
+                    CultureInfo.CurrentUICulture,
+                    FlowDirection.LeftToRight,
+                    currentTypeface,
+                    currentFontSize,
+                    Brushes.Black,
+                    pixelsPerDip: 1);
+            }
+
+            return _cachedFormattedText;
+        }
+
         /// <summary>
         /// Calculate the dimensions of the caret
         /// </summary>
@@ -584,7 +631,7 @@ namespace Vim.UI.Wpf.Implementation.BlockCaret
         private CaretData CreateCaretData(int caretIndex, int numberOfCarets)
         {
             var caretPoint = _caretPoints[caretIndex];
-            _formattedText = CreateFormattedText();
+            _formattedText = GetOrCreateFormattedText();
             var color = TryCalculateCaretColor(caretIndex, numberOfCarets);
             var tuple = CalculateCaretRectAndDisplayOffset(caretPoint);
             var baselineOffset = CalculateBaselineOffset(caretPoint);
@@ -670,12 +717,14 @@ namespace Vim.UI.Wpf.Implementation.BlockCaret
         /// </summary>
         private bool IsAdornmentStale(VirtualSnapshotPoint caretPoint, CaretData caretData, int numberOfCarets)
         {
-            // Size is represented in floating point so strict equality comparison will almost 
-            // always return false.  Use a simple epsilon to test the difference
+            if (caretData.CaretDisplay != _caretDisplay ||
+                caretData.CaretOpacity != _caretOpacity)
+            {
+                return true;
+            }
 
-            if (caretData.Color != TryCalculateCaretColor(caretData.CaretIndex, numberOfCarets)
-                || caretData.CaretDisplay != _caretDisplay
-                || caretData.CaretOpacity != _caretOpacity)
+            var currentColor = TryCalculateCaretColor(caretData.CaretIndex, numberOfCarets);
+            if (caretData.Color != currentColor)
             {
                 return true;
             }
@@ -768,6 +817,43 @@ namespace Vim.UI.Wpf.Implementation.BlockCaret
 
         private void UpdateCaret()
         {
+            UpdateCaret(throttle: true);
+        }
+
+        private void UpdateCaret(bool throttle)
+        {
+            if (throttle)
+            {
+                if (!_updateCaretPending)
+                {
+                    _updateCaretPending = true;
+                    _updateCaretTimer.IsEnabled = true;
+                }
+            }
+            else
+            {
+                if (_isUpdating)
+                {
+                    return;
+                }
+
+                _isUpdating = true;
+                try
+                {
+                    UpdateCaretCore();
+                }
+                finally
+                {
+                    _isUpdating = false;
+                }
+            }
+        }
+
+        private void OnUpdateCaretTimerTick(object sender, EventArgs e)
+        {
+            _updateCaretTimer.IsEnabled = false;
+            _updateCaretPending = false;
+
             if (_isUpdating)
             {
                 return;
@@ -824,6 +910,7 @@ namespace Vim.UI.Wpf.Implementation.BlockCaret
         {
             _isDestroyed = true;
             _blinkTimer.IsEnabled = false;
+            _updateCaretTimer.IsEnabled = false;
             EnsureAdnormentsRemoved();
 
             if (!_textView.IsClosed)

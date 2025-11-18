@@ -15,8 +15,8 @@ namespace Vim.UI.Wpf.Implementation.CommandMargin
         internal CommandMarginFormatDefinition()
         {
             DisplayName = "VsVim Command Margin";
-            ForegroundColor = Colors.Black;
-            BackgroundColor = Colors.White;
+            ForegroundColor = Colors.LightGray;
+            BackgroundColor = Color.FromRgb(30, 30, 30);
         }
     }
 }
